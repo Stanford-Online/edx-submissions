@@ -164,3 +164,39 @@ class TestScoreSummary(TestCase):
         highest = ScoreSummary.objects.get(student_item=item).highest
         self.assertEqual(highest.points_earned, 1)
         self.assertEqual(highest.points_possible, 2)
+
+    def test_override_highest_no_score(self):
+        item = StudentItem.objects.create(
+            student_id="score_test_student",
+            course_id="score_test_course",
+            item_id="i4x://mycourse/special_presentation",
+        )
+
+        # Override score with no score
+        Score.create_override_score(item, 9, 10)
+        highest = ScoreSummary.objects.get(student_item=item).highest
+        self.assertEqual(highest.points_earned, 9)
+        self.assertEqual(highest.points_possible, 10)
+
+    def test_override_highest_with_score(self):
+        item = StudentItem.objects.create(
+            student_id="score_test_student",
+            course_id="score_test_course",
+            item_id="i4x://mycourse/special_presentation",
+        )
+        # Override score after a non-reset score
+        submission = Submission.objects.create(
+            student_item=item,
+            attempt_number=1,
+        )
+        Score.objects.create(
+            student_item=item,
+            submission=submission,
+            points_earned=1,
+            points_possible=15,
+        )
+
+        Score.create_override_score(item, 5, 15)
+        highest = ScoreSummary.objects.get(student_item=item).highest
+        self.assertEqual(highest.points_earned, 5)
+        self.assertEqual(highest.points_possible, 15)
