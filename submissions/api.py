@@ -720,6 +720,77 @@ def set_score(submission_uuid, points_earned, points_possible):
         pass
 
 
+def score_override(student_item_dict, points_override, points_possible):
+    """
+    Create a score override for peer assessment question.
+
+    Args:
+        student_item (dict): The dictionary representation of a student item.
+        points_override (string): Points provided by the instructor as an override.
+        points_possible (string): Max points for this question.
+
+    Returns:
+        True if successful otherwise False
+    """
+    student_item_model = _get_or_create_student_item(student_item_dict)
+    try:
+        Score.create_override_score(student_item_model, points_override, points_possible)
+    except (DatabaseError, ValueError):
+        msg = (
+            u"Error occurred while creating override score for"
+            u" item {item_id} in course {course_id} for student {student_id}"
+            u" points_possible {points_possible} points_override {points_override}"
+        ).format(
+            item_id=student_item_dict['item_id'],
+            course_id=student_item_dict['course_id'],
+            student_id=student_item_dict['student_id'],
+            points_possible=points_possible,
+            points_override=points_override,
+        )
+        logger.exception(msg)
+        raise SubmissionInternalError(msg)
+    else:
+        msg = (
+            u"Score overridden for item {item_id} in course {course_id} for student {student_id}"
+            u" points_possible {points_possible} points_override {points_override}"
+        ).format(
+            item_id=student_item_dict['item_id'],
+            course_id=student_item_dict['course_id'],
+            student_id=student_item_dict['student_id'],
+            points_possible=points_possible,
+            points_override=points_override,
+        )
+        logger.info(msg)
+
+
+def get_score_override(student_item):
+    """
+    Get latest override score for peer assessment question.
+
+    Args:
+        student_item (dict): The dictionary representation of a student item.
+
+    Returns:
+        The latest override score if there is one, otherwise None.
+    """
+
+    try:
+        student_item_model = StudentItem.objects.get(**student_item)
+    except StudentItem.DoesNotExist:
+        return None
+
+    score = Score.objects.filter(
+        student_item=student_item_model,
+        submission=None,
+        reset=False,
+    )
+
+    if score:
+        return ScoreSerializer(score.latest('created_at')).data
+    else:
+        return None
+
+
 def _log_submission(submission, student_item):
     """
     Log the creation of a submission.

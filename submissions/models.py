@@ -205,6 +205,26 @@ class Score(models.Model):
             reset=True,
         )
 
+    @classmethod
+    def create_override_score(cls, student_item_model, points_override, points_possible):
+        """
+        Create an "override" score (a score with a null submission and reset False).
+
+        Args:
+            student_item_model (StudentItem): The student item model.
+            points_override (string): The points provided by the instructor to override
+            points_possible (string): The max points possible for this submission.
+            any existing score.
+
+        """
+
+        return cls.objects.create(
+            student_item=student_item_model,
+            submission=None,
+            points_earned=float(points_override),
+            points_possible=float(points_possible),
+        )
+
     def __unicode__(self):
         return u"{0.points_earned}/{0.points_possible}".format(self)
 
