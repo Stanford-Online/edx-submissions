@@ -3,7 +3,9 @@ Public interface for the submissions app.
 
 """
 import copy
+import itertools
 import logging
+import operator
 import json
 
 from django.conf import settings
@@ -14,7 +16,7 @@ from dogapi import dog_stats_api
 from submissions.serializers import (
     SubmissionSerializer, StudentItemSerializer, ScoreSerializer, JsonFieldError
 )
-from submissions.models import Submission, StudentItem, Score, ScoreSummary
+from submissions.models import Submission, StudentItem, Score, ScoreSummary, score_set, score_reset
 
 logger = logging.getLogger("submissions.api")
 
@@ -373,11 +375,54 @@ def get_submissions(student_item_dict, limit=None):
     return SubmissionSerializer(submission_models, many=True).data
 
 
+def get_all_submissions(course_id, item_id, item_type, read_replica=True):
+    """For the given item, get the most recent submission for every student who has submitted.
+
+    This may return a very large result set! It is implemented as a generator for efficiency.
+
+    Args:
+        course_id, item_id, item_type (string): The values of the respective student_item fields
+            to filter the submissions by.
+        read_replica (bool): If true, attempt to use the read replica database.
+            If no read replica is available, use the default database.
+
+    Yields:
+        Dicts representing the submissions with the following fields:
+            student_item
+            student_id
+            attempt_number
+            submitted_at
+            created_at
+            answer
+
+    Raises:
+        Cannot fail unless there's a database error, but may return an empty iterable.
+    """
+    submission_qs = Submission.objects
+    if read_replica:
+        submission_qs = _use_read_replica(submission_qs)
+    # We cannot use SELECT DISTINCT ON because it's PostgreSQL only, so unfortunately
+    # our results will contain every entry of each student, not just the most recent.
+    # We sort by student_id and primary key, so the reults will be grouped be grouped by
+    # student, with the most recent submission being the first one in each group.
+    query = submission_qs.select_related('student_item').filter(
+        student_item__course_id=course_id,
+        student_item__item_id=item_id,
+        student_item__item_type=item_type,
+    ).order_by('student_item__student_id', '-submitted_at', '-id').iterator()
+
+    for unused_student_id, row_iter in itertools.groupby(query, operator.attrgetter('student_item.student_id')):
+        submission = next(row_iter)
+        data = SubmissionSerializer(submission).data
+        data['student_id'] = submission.student_item.student_id
+        yield data
+
+
 def get_top_submissions(course_id, item_id, item_type, number_of_top_scores, use_cache=True, read_replica=True):
     """Get a number of top scores for an assessment based on a particular student item
 
     This function will return top scores for the piece of assessment.
-    It will ignore the submissions that have 0 score/points_earned.
+    It will consider only the latest and greater than 0 score for a piece of assessment.
     A score is only calculated for a student item if it has completed the workflow for
     a particular assessment module.
 
@@ -443,18 +488,18 @@ def get_top_submissions(course_id, item_id, item_type, number_of_top_scores, use
     # By default, prefer the read-replica.
     if top_submissions is None:
         try:
-            query = Score.objects.filter(
+            query = ScoreSummary.objects.filter(
                 student_item__course_id=course_id,
                 student_item__item_id=item_id,
                 student_item__item_type=item_type,
-                points_earned__gt=0
-            ).select_related("submission").order_by("-points_earned")
+                latest__points_earned__gt=0
+            ).select_related('latest', 'latest__submission').order_by("-latest__points_earned")
 
             if read_replica:
                 query = _use_read_replica(query)
-            scores = query[:number_of_top_scores]
+            score_summaries = query[:number_of_top_scores]
         except DatabaseError:
-            msg = u"Could not fetch top scores for course {}, item {} of type {}".format(
+            msg = u"Could not fetch top score summaries for course {}, item {} of type {}".format(
                 course_id, item_id, item_type
             )
             logger.exception(msg)
@@ -463,10 +508,10 @@ def get_top_submissions(course_id, item_id, item_type, number_of_top_scores, use
         # Retrieve the submission content for each top score
         top_submissions = [
             {
-                "score": score.points_earned,
-                "content": SubmissionSerializer(score.submission).data['answer']
+                "score": score_summary.latest.points_earned,
+                "content": SubmissionSerializer(score_summary.latest.submission).data['answer']
             }
-            for score in scores
+            for score_summary in score_summaries
         ]
 
         # Always store the retrieved list in the cache
@@ -636,6 +681,14 @@ def reset_score(student_id, course_id, item_id):
     # Create a "reset" score
     try:
         Score.create_reset_score(student_item)
+        # Send a signal out to any listeners who are waiting for scoring events.
+        score_reset.send(
+            sender=None,
+            anonymous_user_id=student_id,
+            course_id=course_id,
+            item_id=item_id,
+        )
+
     except DatabaseError:
         msg = (
             u"Error occurred while reseting scores for"
@@ -716,6 +769,15 @@ def set_score(submission_uuid, points_earned, points_possible):
     try:
         score_model = score.save()
         _log_score(score_model)
+        # Send a signal out to any listeners who are waiting for scoring events.
+        score_set.send(
+            sender=None,
+            points_possible=points_possible,
+            points_earned=points_earned,
+            anonymous_user_id=submission_model.student_item.student_id,
+            course_id=submission_model.student_item.course_id,
+            item_id=submission_model.student_item.item_id,
+        )
     except IntegrityError:
         pass
 
