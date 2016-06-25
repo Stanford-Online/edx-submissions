@@ -849,7 +849,7 @@ def get_score_override(student_item):
 
     try:
         student_item_model = StudentItem.objects.get(**student_item)
-    except StudentItem.DoesNotExist:
+    except (TypeError, StudentItem.DoesNotExist):
         return None
 
     score = Score.objects.filter(
