@@ -7,6 +7,7 @@ import ddt
 from django.db import DatabaseError, connection, transaction
 from django.core.cache import cache
 from django.test import TestCase
+from freezegun import freeze_time
 from nose.tools import raises
 from mock import patch
 import pytz
@@ -100,6 +101,51 @@ class TestSubmissionsApi(TestCase):
         self.assertEqual(submissions[0]['student_id'], SECOND_STUDENT_ITEM['student_id'])
         self._assert_submission(submissions[1], ANSWER_TWO, student_item.pk, 2)
         self.assertEqual(submissions[1]['student_id'], STUDENT_ITEM['student_id'])
+
+    @ddt.data(True, False)
+    def test_get_course_submissions(self, set_scores):
+        submission1 = api.create_submission(STUDENT_ITEM, ANSWER_ONE)
+        submission2 = api.create_submission(STUDENT_ITEM, ANSWER_TWO)
+        submission3 = api.create_submission(SECOND_STUDENT_ITEM, ANSWER_ONE)
+        submission4 = api.create_submission(SECOND_STUDENT_ITEM, ANSWER_TWO)
+
+        if set_scores:
+            api.set_score(submission1['uuid'], 1, 4)
+            api.set_score(submission2['uuid'], 2, 4)
+            api.set_score(submission3['uuid'], 3, 4)
+            api.set_score(submission4['uuid'], 4, 4)
+
+        submissions_and_scores = list(api.get_all_course_submission_information(
+            STUDENT_ITEM['course_id'],
+            STUDENT_ITEM['item_type'],
+            read_replica=False,
+        ))
+
+        student_item1 = self._get_student_item(STUDENT_ITEM)
+        student_item2 = self._get_student_item(SECOND_STUDENT_ITEM)
+
+        self.assertDictEqual(SECOND_STUDENT_ITEM, submissions_and_scores[0][0])
+        self._assert_submission(submissions_and_scores[0][1], submission4['answer'], student_item2.pk, 2)
+
+        self.assertDictEqual(SECOND_STUDENT_ITEM, submissions_and_scores[1][0])
+        self._assert_submission(submissions_and_scores[1][1], submission3['answer'], student_item2.pk, 1)
+
+        self.assertDictEqual(STUDENT_ITEM, submissions_and_scores[2][0])
+        self._assert_submission(submissions_and_scores[2][1], submission2['answer'], student_item1.pk, 2)
+
+        self.assertDictEqual(STUDENT_ITEM, submissions_and_scores[3][0])
+        self._assert_submission(submissions_and_scores[3][1], submission1['answer'], student_item1.pk, 1)
+
+        # These scores will always be empty
+        self.assertEqual(submissions_and_scores[1][2], {})
+        self.assertEqual(submissions_and_scores[3][2], {})
+
+        if set_scores:
+            self._assert_score(submissions_and_scores[0][2], 4, 4)
+            self._assert_score(submissions_and_scores[2][2], 2, 4)
+        else:
+            self.assertEqual(submissions_and_scores[0][2], {})
+            self.assertEqual(submissions_and_scores[2][2], {})
 
     def test_get_submission(self):
         # Test base case that we can create a submission and get it back
@@ -256,6 +302,7 @@ class TestSubmissionsApi(TestCase):
         self._assert_score(score, 11, 12)
         self.assertFalse(ScoreAnnotation.objects.all().exists())
 
+    @freeze_time(datetime.datetime.now())
     @patch.object(score_set, 'send')
     def test_set_score_signal(self, send_mock):
         submission = api.create_submission(STUDENT_ITEM, ANSWER_ONE)
@@ -268,7 +315,8 @@ class TestSubmissionsApi(TestCase):
             points_earned=11,
             anonymous_user_id=STUDENT_ITEM['student_id'],
             course_id=STUDENT_ITEM['course_id'],
-            item_id=STUDENT_ITEM['item_id']
+            item_id=STUDENT_ITEM['item_id'],
+            created_at=datetime.datetime.now().replace(tzinfo=pytz.UTC),
         )
 
     @ddt.data(u"First score was incorrect", u"☃")
@@ -572,6 +620,27 @@ class TestSubmissionsApi(TestCase):
                 read_replica=False
             )
         self.assertEqual(cached_scores, scores)
+
+    def test_clear_state(self):
+        # Create a submission, give it a score, and verify that score exists
+        submission = api.create_submission(STUDENT_ITEM, ANSWER_ONE)
+        api.set_score(submission["uuid"], 11, 12)
+        score = api.get_score(STUDENT_ITEM)
+        self._assert_score(score, 11, 12)
+        self.assertEqual(score['submission_uuid'], submission['uuid'])
+
+        # Reset the score with clear_state=True
+        # This should set the submission's score to None, and make it unavailable to get_submissions
+        api.reset_score(
+            STUDENT_ITEM["student_id"],
+            STUDENT_ITEM["course_id"],
+            STUDENT_ITEM["item_id"],
+            clear_state=True,
+        )
+        score = api.get_score(STUDENT_ITEM)
+        self.assertIsNone(score)
+        subs = api.get_submissions(STUDENT_ITEM)
+        self.assertEqual(subs, [])
 
     @raises(api.SubmissionRequestError)
     def test_error_on_get_top_submissions_too_few(self):

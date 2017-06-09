@@ -10,7 +10,7 @@ import json
 
 from django.conf import settings
 from django.core.cache import cache
-from django.db import IntegrityError, DatabaseError, transaction
+from django.db import IntegrityError, DatabaseError
 from dogapi import dog_stats_api
 
 from submissions.serializers import (
@@ -217,10 +217,10 @@ def get_submission(submission_uuid, read_replica=False):
             msg="submission_uuid ({!r}) must be a string type".format(submission_uuid)
         )
 
-    cache_key = "submissions.submission.{}".format(submission_uuid)
+    cache_key = Submission.get_cache_key(submission_uuid)
     try:
         cached_submission_data = cache.get(cache_key)
-    except Exception as ex:
+    except Exception:
         # The cache backend could raise an exception
         # (for example, memcache keys that contain spaces)
         logger.exception("Error occurred while retrieving submission from the cache")
@@ -411,6 +411,65 @@ def get_all_submissions(course_id, item_id, item_type, read_replica=True):
         data = SubmissionSerializer(submission).data
         data['student_id'] = submission.student_item.student_id
         yield data
+
+
+def get_all_course_submission_information(course_id, item_type, read_replica=True):
+    """ For the given course, get all student items of the given item type, all the submissions for those itemes,
+    and the latest scores for each item. If a submission was given a score that is not the latest score for the
+    relevant student item, it will still be included but without score.
+
+    Args:
+        course_id (str): The course that we are getting submissions from.
+        item_type (str): The type of items that we are getting submissions for.
+        read_replica (bool): Try to use the database's read replica if it's available.
+
+    Yields:
+        A tuple of three dictionaries representing:
+        (1) a student item with the following fields:
+            student_id
+            course_id
+            student_item
+            item_type
+        (2) a submission with the following fields:
+            student_item
+            attempt_number
+            submitted_at
+            created_at
+            answer
+        (3) a score with the following fields, if one exists and it is the latest score:
+            (if both conditions are not met, an empty dict is returned here)
+            student_item
+            submission
+            points_earned
+            points_possible
+            created_at
+            submission_uuid
+    """
+
+    submission_qs = Submission.objects
+    if read_replica:
+        submission_qs = _use_read_replica(submission_qs)
+
+    query = submission_qs.select_related('student_item__scoresummary__latest__submission').filter(
+        student_item__course_id=course_id,
+        student_item__item_type=item_type,
+    ).iterator()
+
+    for submission in query:
+        student_item = submission.student_item
+        serialized_score = {}
+        if hasattr(student_item, 'scoresummary'):
+            latest_score = student_item.scoresummary.latest
+
+            # Only include the score if it is not a reset score (is_hidden), and if the current submission is the same
+            # as the student_item's latest score's submission. This matches the behavior of the API's get_score method.
+            if (not latest_score.is_hidden()) and latest_score.submission.uuid == submission.uuid:
+                serialized_score = ScoreSerializer(latest_score).data
+        yield (
+            StudentItemSerializer(student_item).data,
+            SubmissionSerializer(submission).data,
+            serialized_score
+        )
 
 
 def get_top_submissions(course_id, item_id, item_type, number_of_top_scores, use_cache=True, read_replica=True):
@@ -627,8 +686,10 @@ def get_latest_score_for_submission(submission_uuid, read_replica=False):
 
     """
     try:
+        # Ensure that submission_uuid is valid before fetching score
+        submission_model = Submission.objects.get(uuid=submission_uuid)
         score_qs = Score.objects.filter(
-            submission__uuid=submission_uuid
+            submission__uuid=submission_model.uuid
         ).order_by("-id").select_related("submission")
 
         if read_replica:
@@ -637,13 +698,13 @@ def get_latest_score_for_submission(submission_uuid, read_replica=False):
         score = score_qs[0]
         if score.is_hidden():
             return None
-    except IndexError:
+    except (IndexError, Submission.DoesNotExist):
         return None
 
     return ScoreSerializer(score).data
 
 
-def reset_score(student_id, course_id, item_id):
+def reset_score(student_id, course_id, item_id, clear_state=False):
     """
     Reset scores for a specific student on a specific problem.
 
@@ -655,6 +716,7 @@ def reset_score(student_id, course_id, item_id):
         student_id (unicode): The ID of the student for whom to reset scores.
         course_id (unicode): The ID of the course containing the item to reset.
         item_id (unicode): The ID of the item for which to reset scores.
+        clear_state (bool): If True, will appear to delete any submissions associated with the specified StudentItem
 
     Returns:
         None
@@ -675,14 +737,25 @@ def reset_score(student_id, course_id, item_id):
 
     # Create a "reset" score
     try:
-        Score.create_reset_score(student_item)
+        score = Score.create_reset_score(student_item)
         # Send a signal out to any listeners who are waiting for scoring events.
         score_reset.send(
             sender=None,
             anonymous_user_id=student_id,
             course_id=course_id,
             item_id=item_id,
+            created_at=score.created_at,
         )
+
+        if clear_state:
+            for sub in student_item.submission_set.all():
+                # soft-delete the Submission
+                sub.status = Submission.DELETED
+                sub.save(update_fields=["status"])
+
+                # Also clear out cached values
+                cache_key = Submission.get_cache_key(sub.uuid)
+                cache.delete(cache_key)
 
     except DatabaseError:
         msg = (
@@ -742,7 +815,7 @@ def set_score(submission_uuid, points_earned, points_possible,
             u"No submission matching uuid {}".format(submission_uuid)
         )
     except DatabaseError:
-        error_msg = u"Could not retrieve student item: {} or submission {}.".format(
+        error_msg = u"Could not retrieve submission {}.".format(
             submission_uuid
         )
         logger.exception(error_msg)
@@ -788,6 +861,7 @@ def set_score(submission_uuid, points_earned, points_possible,
             anonymous_user_id=submission_model.student_item.student_id,
             course_id=submission_model.student_item.course_id,
             item_id=submission_model.student_item.item_id,
+            created_at=score_model.created_at,
         )
     except IntegrityError:
         pass
